@@ -4,7 +4,7 @@
 const env = require("../config/env");
 const logger = require("../utils/logger");
 
-const HF_BASE = "https://api-inference.huggingface.co/models";
+const HF_BASE = "https://router.huggingface.co/hf-inference/models";
 const HF_HEADERS = () => ({
   Authorization: `Bearer ${env.HF_API_TOKEN}`,
   "Content-Type": "application/json",
@@ -20,7 +20,7 @@ const PATTERNS = [
   },
   {
     name: "fake_upi_request",
-    re: /send.{0,10}₹|pay.{0,10}upi/i,
+    re: /(?:send|pay|transfer|approve|accept).{0,20}(?:₹|rs\.?|inr|upi|collect request|mandate)|(?:upi|collect request|mandate).{0,20}(?:approve|accept|pay|send)/i,
     severity: "HIGH",
     weight: 20,
   },
@@ -96,8 +96,13 @@ const TRANSLATION_MODELS = {
   kn: "Helsinki-NLP/opus-mt-kn-en",
 };
 
+const LANGUAGE_MODEL = "papluca/xlm-roberta-base-language-detection";
+const FRAUD_MODEL = "facebook/bart-large-mnli";
+const NER_MODEL = "dslim/bert-base-NER";
+
 // ── HF fetch with retry ───────────────────────────────────────────────────
 async function hfPost(model, inputs, parameters = undefined, attempt = 0) {
+  const NON_RETRYABLE_STATUS = new Set([400, 401, 403, 404]);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), env.HF_TIMEOUT_MS);
 
@@ -128,12 +133,19 @@ async function hfPost(model, inputs, parameters = undefined, attempt = 0) {
 
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new Error(`HF API ${res.status}: ${text.slice(0, 200)}`);
+      const err = new Error(`HF API ${res.status}: ${text.slice(0, 200)}`);
+      err.status = res.status;
+      throw err;
     }
 
     return await res.json();
   } catch (err) {
     clearTimeout(timer);
+
+    // Fail fast for non-retryable client/auth errors.
+    if (NON_RETRYABLE_STATUS.has(err?.status)) {
+      throw err;
+    }
 
     if (attempt < env.HF_RETRY_ATTEMPTS) {
       const delay = 1000 * Math.pow(2, attempt);
@@ -153,14 +165,11 @@ async function hfPost(model, inputs, parameters = undefined, attempt = 0) {
 // ── Stage 1: Language Detection ───────────────────────────────────────────
 async function detectLanguage(text) {
   try {
-    const data = await hfPost(
-      "facebook/fasttext-language-identification",
-      text.slice(0, 512),
-    );
-    const top = data?.[0]?.[0];
+    const data = await hfPost(LANGUAGE_MODEL, text.slice(0, 512), { top_k: 3 });
+    const top = Array.isArray(data?.[0]) ? data[0][0] : data?.[0];
     if (!top?.label) return { lang: "en", confidence: 0 };
     return {
-      lang: top.label.replace("__label__", ""),
+      lang: String(top.label).replace("__label__", "").toLowerCase(),
       confidence: top.score ?? 0,
     };
   } catch (err) {
@@ -178,7 +187,8 @@ async function translateToEnglish(text, srcLang) {
 
   try {
     const data = await hfPost(model, text);
-    return data?.[0]?.translation_text ?? text;
+    const resultObj = Array.isArray(data?.[0]) ? data[0][0] : data?.[0];
+    return resultObj?.translation_text ?? text;
   } catch (err) {
     logger.warn("Translation failed, proceeding untranslated", {
       srcLang,
@@ -188,34 +198,54 @@ async function translateToEnglish(text, srcLang) {
   }
 }
 
-// ── Stage 3: Spam/Fraud Classification ───────────────────────────────────
-// mshenoda/roberta-spam: LABEL_0 = ham (legitimate), LABEL_1 = spam/fraud
+// ── Stage 3: Fraud Classification ────────────────────────────────────────
+// Zero-shot classification gives us explicit fraud labels and clearer semantics.
 async function classifyFraud(englishText) {
   try {
     const data = await hfPost(
-      'mshenoda/roberta-spam',
-      englishText.slice(0, 512)
+      FRAUD_MODEL,
+      englishText.slice(0, 512),
+      {
+        candidate_labels: [
+          "financial fraud or scam",
+          "promotional or marketing spam",
+          "legitimate transactional message",
+        ],
+        hypothesis_template: "This message is about {}.",
+        multi_label: true,
+      },
     );
 
-    // Response shape: [[{label, score}, ...]] or [{label, score}, ...]
-    const labels = Array.isArray(data?.[0]) ? data[0] : Array.isArray(data) ? data : [];
+    const scoreFor = (name) => {
+      if (Array.isArray(data)) {
+        const entry = data.find((item) => item?.label === name);
+        return entry?.score ?? 0;
+      }
 
-    // LABEL_1 = spam/fraud, LABEL_0 = ham
-    const spamEntry = labels.find(l => l?.label === 'LABEL_1');
-    const hamEntry  = labels.find(l => l?.label === 'LABEL_0');
-    const spamScore = spamEntry?.score ?? 0;
-    const hamScore  = hamEntry?.score  ?? 0;
+      const labels = Array.isArray(data?.labels) ? data.labels : [];
+      const scores = Array.isArray(data?.scores) ? data.scores : [];
+      const index = labels.indexOf(name);
+      return index >= 0 ? scores[index] ?? 0 : 0;
+    };
+    const fraudScore = scoreFor("financial fraud or scam");
+    const spamScore = scoreFor("promotional or marketing spam");
+    const legitScore = scoreFor("legitimate transactional message");
 
-    logger.debug('Spam classification (roberta-spam)', { spamScore, hamScore });
+    logger.debug("Fraud classification (bart-large-mnli)", {
+      fraudScore,
+      spamScore,
+      legitScore,
+      responseShape: Array.isArray(data) ? "array" : "object",
+    });
 
     return {
-      isFraud:   spamScore > 0.6,
-      mlScore:   spamScore,
-      spamScore: spamScore,
-      legitScore: hamScore,
+      isFraud: fraudScore > 0.62 && fraudScore > legitScore,
+      mlScore: fraudScore,
+      spamScore,
+      legitScore,
     };
   } catch (err) {
-    logger.warn('Fraud classification failed', { error: err.message });
+    logger.warn("Fraud classification failed", { error: err.message });
     return { isFraud: false, mlScore: 0, spamScore: 0, legitScore: 0 };
   }
 }
@@ -225,8 +255,12 @@ async function extractEntities(englishText) {
   let nerEntities = [];
 
   try {
-    const data = await hfPost("dslim/bert-base-NER", englishText.slice(0, 512));
-    if (Array.isArray(data)) nerEntities = data;
+    const data = await hfPost(NER_MODEL, englishText.slice(0, 512), {
+      aggregation_strategy: "simple",
+    });
+    if (Array.isArray(data)) {
+      nerEntities = Array.isArray(data[0]) ? data[0] : data;
+    }
   } catch (err) {
     logger.warn("NER extraction failed", { error: err.message });
   }
@@ -236,17 +270,36 @@ async function extractEntities(englishText) {
   RE_URL.lastIndex = 0;
   RE_PHONE.lastIndex = 0;
 
+  const cleanNerWord = (value = "") =>
+    value
+      .replace(/^##/, "")
+      .replace(/##/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const dedupe = (arr) => [...new Set(arr)];
+
+  const bankNames = dedupe(
+    nerEntities
+      .filter((e) => (e.entity_group || e.entity) === "ORG")
+      .map((e) => cleanNerWord(e.word))
+      .filter(Boolean),
+  );
+
+  const names = dedupe(
+    nerEntities
+      .filter((e) => (e.entity_group || e.entity) === "PER")
+      .map((e) => cleanNerWord(e.word))
+      .filter(Boolean),
+  );
+
   return {
     upiIds: [...(englishText.match(RE_UPI) ?? [])],
     amounts: [...(englishText.match(RE_AMOUNT) ?? [])],
     urls: [...(englishText.match(RE_URL) ?? [])],
     phones: [...(englishText.match(RE_PHONE) ?? [])],
-    bankNames: nerEntities
-      .filter((e) => (e.entity_group || e.entity) === "ORG")
-      .map((e) => e.word),
-    names: nerEntities
-      .filter((e) => (e.entity_group || e.entity) === "PER")
-      .map((e) => e.word),
+    bankNames,
+    names,
   };
 }
 
@@ -264,21 +317,36 @@ function aggregateRisk({
   const hasStrongPattern = matchedPatterns.some(
     (p) => p.severity === "HIGH" || p.severity === "CRITICAL",
   );
+  const matchedFlags = new Set(matchedPatterns.map((p) => p.name));
   const patternScore = Math.min(
     matchedPatterns.reduce((s, p) => s + p.weight, 0),
     100,
   );
 
-  const entityRisk =
-    (entities.urls.some((u) => /\.xyz|\.tk|\.ml|\.top|\.ga|\.cf/.test(u))
-      ? 20
-      : 0) +
-    (entities.upiIds.length > 0 ? 5 : 0) +
-    (entities.phones.length > 0 ? 5 : 0);
+  const hasSuspiciousDomain = entities.urls.some((u) =>
+    /\.xyz|\.tk|\.ml|\.top|\.ga|\.cf/i.test(u),
+  );
 
-  // Weights: ML model 35%, pattern matching 50%, entity signals 15%.
-  // Spam-likelihood discount lowers false positives for promotional messages.
-  const baseRaw = mlScore * 100 * 0.35 + patternScore * 0.5 + entityRisk * 0.15;
+  const entityRisk =
+    (hasSuspiciousDomain ? 20 : 0) +
+    (entities.urls.length > 0 ? 8 : 0) +
+    (entities.upiIds.length > 0 ? 5 : 0) +
+    (entities.amounts.length > 0 ? 5 : 0) +
+    (entities.phones.length > 0 ? 5 : 0) +
+    (entities.bankNames.length > 0 ? 4 : 0);
+
+  let synergyBonus = 0;
+  if (isFraud && hasStrongPattern) synergyBonus += 12;
+  if (entities.upiIds.length > 0 && entities.amounts.length > 0) synergyBonus += 8;
+  if (matchedFlags.has("kyc_scam") && entities.upiIds.length > 0) synergyBonus += 12;
+  if (matchedFlags.has("bank_impersonation") && entities.bankNames.length > 0) synergyBonus += 8;
+  if (matchedFlags.has("urgency_keyword") && matchedFlags.has("account_threat")) synergyBonus += 10;
+  if (matchedFlags.has("otp_phishing")) synergyBonus += 12;
+  if (hasSuspiciousDomain) synergyBonus += 10;
+
+  // Weights: ML 35%, patterns 55%, entities 25% with synergy boosts.
+  // Spam discount only applies when strong scam evidence is absent.
+  const baseRaw = mlScore * 100 * 0.35 + patternScore * 0.55 + entityRisk * 0.25 + synergyBonus;
   const spamDiscount = !hasStrongPattern ? spamScore * 20 : 0;
   const raw = baseRaw - spamDiscount;
   const clamped = Math.min(Math.max(Math.round(raw), 0), 100);
@@ -311,7 +379,7 @@ function aggregateRisk({
   };
 }
 
-function buildExplanation(classification, flags, riskScore) {
+function buildExplanation(classification, flags) {
   const base =
     {
       FRAUDULENT: "This message shows strong indicators of fraud.",
@@ -382,11 +450,7 @@ async function runPipeline(rawMessage) {
       lang !== "en" && TRANSLATION_MODELS[lang] ? englishText : null,
     ...risk,
     confidence: parseFloat(mlScore.toFixed(4)),
-    explanation: buildExplanation(
-      risk.classification,
-      risk.flags,
-      risk.riskScore,
-    ),
+    explanation: buildExplanation(risk.classification, risk.flags),
     entities,
     hfLatencyMs,
   };
