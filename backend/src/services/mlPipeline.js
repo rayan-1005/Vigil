@@ -1,4 +1,3 @@
-// src/services/mlPipeline.js
 "use strict";
 
 const env = require("../config/env");
@@ -19,8 +18,9 @@ const PATTERNS = [
     weight: 25,
   },
   {
+    // FIX (Bug 3): widened .{0,20} → .{0,40} so "Send Rs.500 processing fee to UPI" matches
     name: "fake_upi_request",
-    re: /(?:send|pay|transfer|approve|accept).{0,20}(?:₹|rs\.?|inr|upi|collect request|mandate)|(?:upi|collect request|mandate).{0,20}(?:approve|accept|pay|send)/i,
+    re: /(?:send|pay|transfer|approve|accept).{0,40}(?:₹|rs\.?|inr|upi|collect request|mandate)|(?:upi|collect request|mandate).{0,40}(?:approve|accept|pay|send)/i,
     severity: "HIGH",
     weight: 20,
   },
@@ -78,10 +78,18 @@ const PATTERNS = [
     severity: "HIGH",
     weight: 20,
   },
+  // FIX (Bug 5): new pattern — advance-fee fraud ("processing fee", "registration fee", etc.)
+  {
+    name: "advance_fee",
+    re: /(?:processing|registration|activation|delivery|handling).{0,15}fee/i,
+    severity: "HIGH",
+    weight: 20,
+  },
 ];
 
 // Entity extraction regexes
-const RE_UPI = /[a-zA-Z0-9._-]{3,}@[a-zA-Z]{2,}/g;
+// FIX (Bug 3): relaxed local-part minimum {3,} → {2,} to catch short UPI IDs like "p@ybl"
+const RE_UPI = /[a-zA-Z0-9._-]{2,}@[a-zA-Z]{2,}/g;
 const RE_AMOUNT = /(?:₹|Rs\.?|INR)\s*[\d,]+/gi;
 const RE_URL = /https?:\/\/[^\s<>"']+|www\.[^\s<>"']+/gi;
 const RE_PHONE = /(?:\+91|0)?[6-9]\d{9}/g;
@@ -142,7 +150,6 @@ async function hfPost(model, inputs, parameters = undefined, attempt = 0) {
   } catch (err) {
     clearTimeout(timer);
 
-    // Fail fast for non-retryable client/auth errors.
     if (NON_RETRYABLE_STATUS.has(err?.status)) {
       throw err;
     }
@@ -165,7 +172,12 @@ async function hfPost(model, inputs, parameters = undefined, attempt = 0) {
 // ── Stage 1: Language Detection ───────────────────────────────────────────
 async function detectLanguage(text) {
   try {
-    const data = await hfPost(LANGUAGE_MODEL, text.slice(0, 512), { top_k: 3 });
+    // FIX (Bug 6): raised slice from 512 → 1024 chars; XLM-RoBERTa limit is
+    // 512 *tokens*, not chars — 512 chars was too conservative and caused
+    // mixed-script messages to be misclassified, skipping translation.
+    const data = await hfPost(LANGUAGE_MODEL, text.slice(0, 1024), {
+      top_k: 3,
+    });
     const top = Array.isArray(data?.[0]) ? data[0][0] : data?.[0];
     if (!top?.label) return { lang: "en", confidence: 0 };
     return {
@@ -199,34 +211,41 @@ async function translateToEnglish(text, srcLang) {
 }
 
 // ── Stage 3: Fraud Classification ────────────────────────────────────────
-// Zero-shot classification gives us explicit fraud labels and clearer semantics.
 async function classifyFraud(englishText) {
   try {
-    const data = await hfPost(
-      FRAUD_MODEL,
-      englishText.slice(0, 512),
-      {
-        candidate_labels: [
-          "financial fraud or scam",
-          "promotional or marketing spam",
-          "legitimate transactional message",
-        ],
-        hypothesis_template: "This message is about {}.",
-        multi_label: true,
-      },
-    );
+    const data = await hfPost(FRAUD_MODEL, englishText.slice(0, 512), {
+      candidate_labels: [
+        "financial fraud or scam",
+        "promotional or marketing spam",
+        "legitimate transactional message",
+      ],
+      hypothesis_template: "This message is about {}.",
+      multi_label: true,
+    });
 
+    // FIX (Bug 1): the HF inference router for bart-large-mnli returns either:
+    //   (a) [{label, score}, …]          — flat array
+    //   (b) [[{label, score}, …]]        — nested array (one extra wrapper)
+    //   (c) {labels: […], scores: […]}   — object shape
+    // Previously the flat-array branch called data.find() which only works if
+    // data is the flat array itself; a nested array made data[0] still an array,
+    // so find() was called on an array of arrays and always returned undefined
+    // → every score was 0.  We now normalise to a flat array first.
     const scoreFor = (name) => {
+      // Normalise all three shapes to a flat [{label, score}] array
+      let flat;
       if (Array.isArray(data)) {
-        const entry = data.find((item) => item?.label === name);
+        flat = Array.isArray(data[0]) ? data[0] : data;
+        const entry = flat.find((item) => item?.label === name);
         return entry?.score ?? 0;
       }
-
+      // Object shape: {labels:[…], scores:[…]}
       const labels = Array.isArray(data?.labels) ? data.labels : [];
       const scores = Array.isArray(data?.scores) ? data.scores : [];
       const index = labels.indexOf(name);
-      return index >= 0 ? scores[index] ?? 0 : 0;
+      return index >= 0 ? (scores[index] ?? 0) : 0;
     };
+
     const fraudScore = scoreFor("financial fraud or scam");
     const spamScore = scoreFor("promotional or marketing spam");
     const legitScore = scoreFor("legitimate transactional message");
@@ -235,7 +254,11 @@ async function classifyFraud(englishText) {
       fraudScore,
       spamScore,
       legitScore,
-      responseShape: Array.isArray(data) ? "array" : "object",
+      responseShape: Array.isArray(data)
+        ? Array.isArray(data[0])
+          ? "nested-array"
+          : "flat-array"
+        : "object",
     });
 
     return {
@@ -251,16 +274,29 @@ async function classifyFraud(englishText) {
 }
 
 // ── Stage 4: NER ──────────────────────────────────────────────────────────
+// FIX (Bug 2): dslim/bert-base-NER on the HF inference REST API does NOT
+// accept `parameters.aggregation_strategy` — that is a transformers pipeline
+// constructor argument, not a model parameter.  Sending it caused a 400, which
+// is in NON_RETRYABLE_STATUS, so the call threw immediately and nerEntities
+// was always [].  We now:
+//   1. Remove the parameters argument entirely.
+//   2. Receive the raw token-level predictions (B-/I- prefix tags).
+//   3. Merge consecutive tokens that belong to the same entity span in JS,
+//      including stripping WordPiece "##" continuations.
 async function extractEntities(englishText) {
   let nerEntities = [];
 
   try {
-    const data = await hfPost(NER_MODEL, englishText.slice(0, 512), {
-      aggregation_strategy: "simple",
-    });
-    if (Array.isArray(data)) {
-      nerEntities = Array.isArray(data[0]) ? data[0] : data;
-    }
+    // No parameters — raw token predictions returned
+    const data = await hfPost(NER_MODEL, englishText.slice(0, 512));
+    const raw = Array.isArray(data)
+      ? Array.isArray(data[0])
+        ? data[0]
+        : data
+      : [];
+
+    // Merge B-/I- token spans into whole entities (poor-man's aggregation)
+    nerEntities = mergeNerSpans(raw);
   } catch (err) {
     logger.warn("NER extraction failed", { error: err.message });
   }
@@ -271,24 +307,20 @@ async function extractEntities(englishText) {
   RE_PHONE.lastIndex = 0;
 
   const cleanNerWord = (value = "") =>
-    value
-      .replace(/^##/, "")
-      .replace(/##/g, "")
-      .replace(/\s+/g, " ")
-      .trim();
+    value.replace(/^##/, "").replace(/##/g, "").replace(/\s+/g, " ").trim();
 
   const dedupe = (arr) => [...new Set(arr)];
 
   const bankNames = dedupe(
     nerEntities
-      .filter((e) => (e.entity_group || e.entity) === "ORG")
+      .filter((e) => e.entity_group === "ORG")
       .map((e) => cleanNerWord(e.word))
       .filter(Boolean),
   );
 
   const names = dedupe(
     nerEntities
-      .filter((e) => (e.entity_group || e.entity) === "PER")
+      .filter((e) => e.entity_group === "PER")
       .map((e) => cleanNerWord(e.word))
       .filter(Boolean),
   );
@@ -301,6 +333,52 @@ async function extractEntities(englishText) {
     bankNames,
     names,
   };
+}
+
+// Merge raw B-/I- token predictions into aggregated entity spans.
+// Each token from dslim/bert-base-NER looks like:
+//   { entity: "B-ORG", word: "SBI", score: 0.99, start: 4, end: 7 }
+// We collect consecutive I-* tokens that share the same type as the
+// preceding B-* token into a single span, then expose entity_group.
+function mergeNerSpans(tokens) {
+  const spans = [];
+  let current = null;
+
+  for (const tok of tokens) {
+    const entity = tok.entity ?? "";
+    const prefix = entity.slice(0, 2); // "B-" | "I-" | "O"
+    const type = entity.slice(2); // "ORG" | "PER" | "LOC" | "MISC"
+
+    if (prefix === "B-") {
+      if (current) spans.push(current);
+      current = {
+        entity_group: type,
+        word: tok.word ?? "",
+        score: tok.score ?? 0,
+        start: tok.start,
+        end: tok.end,
+        count: 1,
+      };
+    } else if (prefix === "I-" && current && current.entity_group === type) {
+      // Continuation token — append word and extend span
+      const word = tok.word ?? "";
+      current.word += word.startsWith("##") ? word.slice(2) : ` ${word}`;
+      current.end = tok.end;
+      current.score =
+        (current.score * current.count + (tok.score ?? 0)) /
+        (current.count + 1);
+      current.count += 1;
+    } else {
+      // O tag or type mismatch — close current span
+      if (current) {
+        spans.push(current);
+        current = null;
+      }
+    }
+  }
+
+  if (current) spans.push(current);
+  return spans;
 }
 
 // ── Stage 5: Risk Aggregation ─────────────────────────────────────────────
@@ -337,27 +415,38 @@ function aggregateRisk({
 
   let synergyBonus = 0;
   if (isFraud && hasStrongPattern) synergyBonus += 12;
-  if (entities.upiIds.length > 0 && entities.amounts.length > 0) synergyBonus += 8;
-  if (matchedFlags.has("kyc_scam") && entities.upiIds.length > 0) synergyBonus += 12;
-  if (matchedFlags.has("bank_impersonation") && entities.bankNames.length > 0) synergyBonus += 8;
-  if (matchedFlags.has("urgency_keyword") && matchedFlags.has("account_threat")) synergyBonus += 10;
+  if (entities.upiIds.length > 0 && entities.amounts.length > 0)
+    synergyBonus += 8;
+  if (matchedFlags.has("kyc_scam") && entities.upiIds.length > 0)
+    synergyBonus += 12;
+  if (matchedFlags.has("bank_impersonation") && entities.bankNames.length > 0)
+    synergyBonus += 8;
+  if (matchedFlags.has("urgency_keyword") && matchedFlags.has("account_threat"))
+    synergyBonus += 10;
   if (matchedFlags.has("otp_phishing")) synergyBonus += 12;
   if (hasSuspiciousDomain) synergyBonus += 10;
+  // Extra synergy for prize + UPI advance-fee combo (test message pattern)
+  if (matchedFlags.has("prize_scam") && matchedFlags.has("advance_fee"))
+    synergyBonus += 10;
+  if (matchedFlags.has("prize_scam") && entities.upiIds.length > 0)
+    synergyBonus += 8;
 
-  // Weights: ML 35%, patterns 55%, entities 25% with synergy boosts.
-  // Spam discount only applies when strong scam evidence is absent.
-  const baseRaw = mlScore * 100 * 0.35 + patternScore * 0.55 + entityRisk * 0.25 + synergyBonus;
+  // FIX (Bug 4): original weights summed to 115% (ML 35 + patterns 55 + entities 25).
+  // Renormalised to ML 30% + patterns 50% + entities 20% = 100%, preserving the
+  // intended pattern-dominance when ML degrades gracefully.
+  // Spam discount is unchanged — only applies when no strong scam pattern is present.
+  const baseRaw =
+    mlScore * 100 * 0.3 + patternScore * 0.5 + entityRisk * 0.2 + synergyBonus;
   const spamDiscount = !hasStrongPattern ? spamScore * 20 : 0;
   const raw = baseRaw - spamDiscount;
   const clamped = Math.min(Math.max(Math.round(raw), 0), 100);
 
-  // Classification driven by score alone – not gated on isFraud boolean
   let classification;
-  if (clamped >= 65 && (isFraud || hasStrongPattern)) classification = "FRAUDULENT";
+  if (clamped >= 65 && (isFraud || hasStrongPattern))
+    classification = "FRAUDULENT";
   else if (clamped >= 35) classification = "SUSPICIOUS";
   else classification = "LEGITIMATE";
 
-  // Bump classification if ML model is confident even if score is borderline
   if (isFraud && classification === "LEGITIMATE") classification = "SUSPICIOUS";
 
   return {
@@ -402,6 +491,10 @@ function buildExplanation(classification, flags) {
   if (flags.includes("fake_gov"))
     details.push(
       "Verify government scheme communications on official .gov.in sites.",
+    );
+  if (flags.includes("advance_fee"))
+    details.push(
+      "Requests for a 'processing fee' to claim a prize or refund are a classic scam.",
     );
 
   return details.length > 0 ? base + " " + details.join(" ") : base;
